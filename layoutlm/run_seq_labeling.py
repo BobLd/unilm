@@ -842,7 +842,7 @@ def main():
                             + predictions[example_id].pop(0)
                             + "\n"
                         )
-                        writer.write(output_line)
+                        writer.write(str(output_line.encode('utf-8')))
                     else:
                         logger.warning(
                             "Maximum sequence length exceeded: No prediction for '%s'.",
