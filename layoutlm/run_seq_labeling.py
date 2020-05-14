@@ -811,9 +811,9 @@ def main():
 
     if args.do_predict and args.local_rank in [-1, 0]:
         tokenizer = tokenizer_class.from_pretrained(
-            args.output_dir, do_lower_case=args.do_lower_case
+            args.model_name_or_path, do_lower_case=args.do_lower_case
         )
-        model = model_class.from_pretrained(args.output_dir)
+        model = model_class.from_pretrained(args.model_name_or_path)
         model.to(args.device)
         result, predictions = evaluate(
             args, model, tokenizer, labels, pad_token_label_id, mode="test"
@@ -828,7 +828,7 @@ def main():
             args.output_dir, "test_predictions.txt"
         )
         with open(output_test_predictions_file, "w") as writer:
-            with open(os.path.join(args.data_dir, "test.txt"), "r") as f:
+            with open(os.path.join(args.data_dir, "test.txt"), "r", encoding="utf8") as f:
                 example_id = 0
                 for line in f:
                     if line.startswith("-DOCSTART-") or line == "" or line == "\n":
