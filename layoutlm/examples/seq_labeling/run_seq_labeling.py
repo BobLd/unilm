@@ -21,48 +21,42 @@ import argparse
 import glob
 import logging
 import os
-import shutil
 import random
+import shutil
 
 import numpy as np
 import torch
 from seqeval.metrics import (
+    classification_report,
+    f1_score,
     precision_score,
     recall_score,
-    f1_score,
-    classification_report,
 )
 from tensorboardX import SummaryWriter
 from torch.nn import CrossEntropyLoss
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
-from utils_seq_labeling import (
-    convert_examples_to_features,
-    get_labels,
-    read_examples_from_file,
-)
-from modeling_layoutlm import LayoutLMForTokenClassification
-from transformers import AdamW, get_linear_schedule_with_warmup
 from transformers import (
     WEIGHTS_NAME,
+    AdamW,
     BertConfig,
     BertForTokenClassification,
     BertTokenizer,
+    RobertaConfig,
+    RobertaForTokenClassification,
+    RobertaTokenizer,
+    get_linear_schedule_with_warmup,
 )
-from transformers import RobertaConfig, RobertaForTokenClassification, RobertaTokenizer
-from transformers import (
-    DistilBertConfig,
-    DistilBertForTokenClassification,
-    DistilBertTokenizer,
-)
+
+from layoutlm import FunsdDataset, LayoutlmConfig, LayoutlmForTokenClassification
 
 logger = logging.getLogger(__name__)
 
 ALL_MODELS = sum(
     (
         tuple(conf.pretrained_config_archive_map.keys())
-        for conf in (BertConfig, RobertaConfig, DistilBertConfig)
+        for conf in (BertConfig, RobertaConfig, LayoutlmConfig)
     ),
     (),
 )
@@ -70,12 +64,7 @@ ALL_MODELS = sum(
 MODEL_CLASSES = {
     "bert": (BertConfig, BertForTokenClassification, BertTokenizer),
     "roberta": (RobertaConfig, RobertaForTokenClassification, RobertaTokenizer),
-    "distilbert": (
-        DistilBertConfig,
-        DistilBertForTokenClassification,
-        DistilBertTokenizer,
-    ),
-    "layoutlm": (BertConfig, LayoutLMForTokenClassification, BertTokenizer),
+    "layoutlm": (LayoutlmConfig, LayoutlmForTokenClassification, BertTokenizer),
 }
 
 
@@ -87,10 +76,28 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
-def train(args, train_dataset, model, tokenizer, labels, pad_token_label_id):
+def collate_fn(data):
+    batch = [i for i in zip(*data)]
+    for i in range(len(batch)):
+        if i < len(batch) - 2:
+            batch[i] = torch.stack(batch[i], 0)
+    return tuple(batch)
+
+
+def get_labels(path):
+    with open(path, "r") as f:
+        labels = f.read().splitlines()
+    if "O" not in labels:
+        labels = ["O"] + labels
+    return labels
+
+
+def train(  # noqa C901
+    args, train_dataset, model, tokenizer, labels, pad_token_label_id
+):
     """ Train the model """
     if args.local_rank in [-1, 0]:
-        tb_writer = SummaryWriter()
+        tb_writer = SummaryWriter(logdir="runs/" + os.path.basename(args.output_dir))
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     train_sampler = (
@@ -99,7 +106,10 @@ def train(args, train_dataset, model, tokenizer, labels, pad_token_label_id):
         else DistributedSampler(train_dataset)
     )
     train_dataloader = DataLoader(
-        train_dataset, sampler=train_sampler, batch_size=args.train_batch_size
+        train_dataset,
+        sampler=train_sampler,
+        batch_size=args.train_batch_size,
+        collate_fn=None,
     )
 
     if args.max_steps > 0:
@@ -195,27 +205,20 @@ def train(args, train_dataset, model, tokenizer, labels, pad_token_label_id):
         )
         for step, batch in enumerate(epoch_iterator):
             model.train()
-            if args.model_type != "layoutlm":
-                batch = batch[:4]
-            batch = tuple(t.to(args.device) for t in batch)
             inputs = {
-                "input_ids": batch[0],
-                "attention_mask": batch[1],
-                "labels": batch[3],
+                "input_ids": batch[0].to(args.device),
+                "attention_mask": batch[1].to(args.device),
+                "labels": batch[3].to(args.device),
             }
-            if args.model_type == "layoutlm":
-                inputs["bbox"] = batch[4]
-            if args.model_type != "distilbert":
-                inputs["token_type_ids"] = (
-                    batch[2]
-                    if args.model_type in ["bert", "xlnet", "layoutlm"]
-                    else None
-                )  # XLM and RoBERTa don"t use segment_ids
+            if args.model_type in ["layoutlm"]:
+                inputs["bbox"] = batch[4].to(args.device)
+            inputs["token_type_ids"] = (
+                batch[2].to(args.device) if args.model_type in ["bert", "layoutlm"] else None
+            )  # RoBERTa don"t use segment_ids
 
             outputs = model(**inputs)
-            loss = outputs[
-                0
-            ]  # model outputs are always tuple in pytorch-transformers (see doc)
+            # model outputs are always tuple in pytorch-transformers (see doc)
+            loss = outputs[0]
 
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -238,9 +241,8 @@ def train(args, train_dataset, model, tokenizer, labels, pad_token_label_id):
                     torch.nn.utils.clip_grad_norm_(
                         model.parameters(), args.max_grad_norm
                     )
-
-                scheduler.step()  # Update learning rate schedule
                 optimizer.step()
+                scheduler.step()  # Update learning rate schedule
                 model.zero_grad()
                 global_step += 1
 
@@ -251,7 +253,7 @@ def train(args, train_dataset, model, tokenizer, labels, pad_token_label_id):
                 ):
                     # Log metrics
                     if (
-                        args.local_rank == -1 and args.evaluate_during_training
+                        args.local_rank in [-1, 0] and args.evaluate_during_training
                     ):  # Only evaluate when single GPU otherwise metrics may not average well
                         results, _ = evaluate(
                             args,
@@ -288,6 +290,7 @@ def train(args, train_dataset, model, tokenizer, labels, pad_token_label_id):
                         model.module if hasattr(model, "module") else model
                     )  # Take care of distributed/parallel training
                     model_to_save.save_pretrained(output_dir)
+                    tokenizer.save_pretrained(output_dir)
                     torch.save(args, os.path.join(output_dir, "training_args.bin"))
                     logger.info("Saving model checkpoint to %s", output_dir)
 
@@ -305,19 +308,15 @@ def train(args, train_dataset, model, tokenizer, labels, pad_token_label_id):
 
 
 def evaluate(args, model, tokenizer, labels, pad_token_label_id, mode, prefix=""):
-    eval_dataset = load_and_cache_examples(
-        args, tokenizer, labels, pad_token_label_id, mode=mode
-    )
+    eval_dataset = FunsdDataset(args, tokenizer, labels, pad_token_label_id, mode=mode)
 
     args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
-    # Note that DistributedSampler samples randomly
-    eval_sampler = (
-        SequentialSampler(eval_dataset)
-        if args.local_rank == -1
-        else DistributedSampler(eval_dataset)
-    )
+    eval_sampler = SequentialSampler(eval_dataset)
     eval_dataloader = DataLoader(
-        eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size
+        eval_dataset,
+        sampler=eval_sampler,
+        batch_size=args.eval_batch_size,
+        collate_fn=None,
     )
 
     # Eval!
@@ -330,22 +329,19 @@ def evaluate(args, model, tokenizer, labels, pad_token_label_id, mode, prefix=""
     out_label_ids = None
     model.eval()
     for batch in tqdm(eval_dataloader, desc="Evaluating"):
-        if args.model_type != "layoutlm":
-            batch = batch[:4]
-        batch = tuple(t.to(args.device) for t in batch)
-
         with torch.no_grad():
             inputs = {
-                "input_ids": batch[0],
-                "attention_mask": batch[1],
-                "labels": batch[3],
+                "input_ids": batch[0].to(args.device),
+                "attention_mask": batch[1].to(args.device),
+                "labels": batch[3].to(args.device),
             }
-            if args.model_type == "layoutlm":
-                inputs["bbox"] = batch[4]
-            if args.model_type != "distilbert":
-                inputs["token_type_ids"] = (
-                    batch[2] if args.model_type in ["bert", "xlnet", "layoutlm"] else None
-                )  # XLM and RoBERTa don"t use segment_ids
+            if args.model_type in ["layoutlm"]:
+                inputs["bbox"] = batch[4].to(args.device)
+            inputs["token_type_ids"] = (
+                batch[2].to(args.device)
+                if args.model_type in ["bert", "layoutlm"]
+                else None
+            )  # RoBERTa don"t use segment_ids
             outputs = model(**inputs)
             tmp_eval_loss, logits = outputs[:2]
 
@@ -396,64 +392,7 @@ def evaluate(args, model, tokenizer, labels, pad_token_label_id, mode, prefix=""
     return results, preds_list
 
 
-def load_and_cache_examples(args, tokenizer, labels, pad_token_label_id, mode):
-    if args.local_rank not in [-1, 0] and not evaluate:
-        torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
-
-    # Load data features from cache or dataset file
-    cached_features_file = os.path.join(
-        args.data_dir,
-        "cached_{}_{}_{}".format(
-            mode,
-            list(filter(None, args.model_name_or_path.split("/"))).pop(),
-            str(args.max_seq_length),
-        ),
-    )
-    if os.path.exists(cached_features_file) and not args.overwrite_cache:
-        logger.info("Loading features from cached file %s", cached_features_file)
-        features = torch.load(cached_features_file)
-    else:
-        logger.info("Creating features from dataset file at %s", args.data_dir)
-        examples = read_examples_from_file(args.data_dir, mode)
-        features = convert_examples_to_features(
-            examples,
-            labels,
-            args.max_seq_length,
-            tokenizer,
-            cls_token_at_end=bool(args.model_type in ["xlnet"]),
-            # xlnet has a cls token at the end
-            cls_token=tokenizer.cls_token,
-            cls_token_segment_id=2 if args.model_type in ["xlnet"] else 0,
-            sep_token=tokenizer.sep_token,
-            sep_token_extra=bool(args.model_type in ["roberta"]),
-            # roberta uses an extra separator b/w pairs of sentences, cf. github.com/pytorch/fairseq/commit/1684e166e3da03f5b600dbb7855cb98ddfcd0805
-            pad_on_left=bool(args.model_type in ["xlnet"]),
-            # pad on the left for xlnet
-            pad_token=tokenizer.convert_tokens_to_ids([tokenizer.pad_token])[0],
-            pad_token_segment_id=4 if args.model_type in ["xlnet"] else 0,
-            pad_token_label_id=pad_token_label_id,
-        )
-        if args.local_rank in [-1, 0]:
-            logger.info("Saving features into cached file %s", cached_features_file)
-            torch.save(features, cached_features_file)
-
-    if args.local_rank == 0 and not evaluate:
-        torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
-
-    # Convert to Tensors and build dataset
-    all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
-    all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
-    all_segment_ids = torch.tensor([f.segment_ids for f in features], dtype=torch.long)
-    all_label_ids = torch.tensor([f.label_ids for f in features], dtype=torch.long)
-    all_bboxes = torch.tensor([f.boxes for f in features], dtype=torch.long)
-
-    dataset = TensorDataset(
-        all_input_ids, all_input_mask, all_segment_ids, all_label_ids, all_bboxes,
-    )
-    return dataset
-
-
-def main():
+def main():  # noqa C901
     parser = argparse.ArgumentParser()
 
     ## Required parameters
@@ -514,7 +453,7 @@ def main():
     )
     parser.add_argument(
         "--max_seq_length",
-        default=128,
+        default=512,
         type=int,
         help="The maximum total input sequence length after tokenization. Sequences longer "
         "than this will be truncated, sequences shorter will be padded.",
@@ -651,13 +590,30 @@ def main():
         os.path.exists(args.output_dir)
         and os.listdir(args.output_dir)
         and args.do_train
-        and not args.overwrite_output_dir
     ):
+        if not args.overwrite_output_dir:
+            raise ValueError(
+                "Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(
+                    args.output_dir
+                )
+            )
+        else:
+            if args.local_rank in [-1, 0]:
+                shutil.rmtree(args.output_dir)
+
+    if not os.path.exists(args.output_dir) and (args.do_eval or args.do_predict):
         raise ValueError(
-            "Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(
+            "Output directory ({}) does not exist. Please train and save the model before inference stage.".format(
                 args.output_dir
             )
         )
+
+    if (
+        not os.path.exists(args.output_dir)
+        and args.do_train
+        and args.local_rank in [-1, 0]
+    ):
+        os.makedirs(args.output_dir)
 
     # Setup distant debugging if needed
     if args.server_ip and args.server_port:
@@ -673,10 +629,9 @@ def main():
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1 or args.no_cuda:
         device = torch.device(
-            "cuda:0" if torch.cuda.is_available() and not args.no_cuda else "cpu"
+            "cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu"
         )
-        torch.cuda.set_device(device)
-        args.n_gpu = torch.cuda.device_count()
+        args.n_gpu = 0 if args.no_cuda else torch.cuda.device_count()
     else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.cuda.set_device(args.local_rank)
         device = torch.device("cuda", args.local_rank)
@@ -684,12 +639,11 @@ def main():
         args.n_gpu = 1
     args.device = device
 
-    if args.overwrite_output_dir and os.path.exists(args.output_dir):
-        shutil.rmtree(args.output_dir)
-    os.makedirs(args.output_dir)
     # Setup logging
     logging.basicConfig(
-        filename=os.path.join(args.output_dir, "train.log"),
+        filename=os.path.join(args.output_dir, "train.log")
+        if args.local_rank in [-1, 0]
+        else None,
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN,
@@ -706,7 +660,6 @@ def main():
     # Set seed
     set_seed(args)
 
-    # Prepare CONLL-2003 task
     labels = get_labels(args.labels)
     num_labels = len(labels)
     # Use cross entropy ignore index as padding label id so that only real label ids contribute to the loss later
@@ -744,7 +697,7 @@ def main():
 
     # Training
     if args.do_train:
-        train_dataset = load_and_cache_examples(
+        train_dataset = FunsdDataset(
             args, tokenizer, labels, pad_token_label_id, mode="train"
         )
         global_step, tr_loss = train(
@@ -798,7 +751,7 @@ def main():
                 tokenizer,
                 labels,
                 pad_token_label_id,
-                mode="dev",
+                mode="test",
                 prefix=global_step,
             )
             if global_step:
@@ -827,8 +780,15 @@ def main():
         output_test_predictions_file = os.path.join(
             args.output_dir, "test_predictions.txt"
         )
+<<<<<<< HEAD:layoutlm/run_seq_labeling.py
         with open(output_test_predictions_file, "w") as writer:
             with open(os.path.join(args.data_dir, "test.txt"), "r", encoding="utf8") as f:
+=======
+        with open(output_test_predictions_file, "w", encoding="utf8") as writer:
+            with open(
+                os.path.join(args.data_dir, "test.txt"), "r", encoding="utf8"
+            ) as f:
+>>>>>>> 97be60f414039c01c6efcf4fb9f7ce38c617d66f:layoutlm/examples/seq_labeling/run_seq_labeling.py
                 example_id = 0
                 for line in f:
                     if line.startswith("-DOCSTART-") or line == "" or line == "\n":
